@@ -16,6 +16,7 @@ module Data.ECTA.Internal.ECTA.Enumeration (
   , uvarRepresentative
   , uvarValues
   , initEnumerationState
+  , initEnumerationConfig
 
 
   , EnumerateM
@@ -39,9 +40,10 @@ module Data.ECTA.Internal.ECTA.Enumeration (
   , getAllTruncatedTerms
   , getAllTerms
   , naiveDenotation
+  , naiveDenotationBounded
   ) where
 
-import Control.Monad ( forM_, guard )
+import Control.Monad ( forM_, guard, unless )
 import Control.Monad.State.Strict ( StateT(..) )
 import qualified Data.IntMap as IntMap
 import Data.Maybe ( fromMaybe, isJust )
@@ -65,6 +67,8 @@ import Data.ECTA.Term
 import           Data.Persistent.UnionFind ( UnionFind, UVar, uvarToInt, intToUVar, UVarGen )
 import qualified Data.Persistent.UnionFind as UnionFind
 import Data.Text.Extended.Pretty
+import Control.Monad.Reader
+import Text.ParserCombinators.ReadPrec (reset)
 
 -------------------------------------------------------------------------------
 
@@ -149,6 +153,18 @@ initEnumerationState n = let (uvg, uv) = UnionFind.nextUVar UnionFind.initUVarGe
                                              (Sequence.singleton (UVarUnenumerated (Just n) Sequence.Empty))
 
 
+-----------------------
+------- Top-level state
+-----------------------
+
+newtype EnumerationConfig = EnumerationConfig {
+    maxDepth       :: Int
+  }
+  deriving ( Eq, Ord, Show )
+
+initEnumerationConfig :: Int -> EnumerationConfig
+initEnumerationConfig = EnumerationConfig
+
 
 ---------------------------------------------------------------------------
 ---------------------------- Enumeration monad ----------------------------
@@ -159,10 +175,10 @@ initEnumerationState n = let (uvg, uv) = UnionFind.nextUVar UnionFind.initUVarGe
 ---------------------
 
 
-type EnumerateM = StateT EnumerationState []
+type EnumerateM = ReaderT EnumerationConfig (StateT EnumerationState [])
 
-runEnumerateM :: EnumerateM a -> EnumerationState -> [(a, EnumerationState)]
-runEnumerateM = runStateT
+runEnumerateM :: EnumerateM a -> EnumerationConfig -> EnumerationState -> [(a, EnumerationState)]
+runEnumerateM f cfg = runStateT (runReaderT f cfg)
 
 
 ---------------------
@@ -267,28 +283,43 @@ enumerateNode _   EmptyNode = mzero
 enumerateNode scs n         =
   let (hereConstraints, descendantConstraints) = Sequence.partition (\(SuspendedConstraint pt _) -> isTerminalPathTrie pt) scs
   in case hereConstraints of
+       -- here, instead of enumerating constraints recursively, the Mu node is suspended and discarded
        Sequence.Empty -> case n of
-                           Mu _    -> TermFragmentUVar <$> addUVarValue (Just n)
-                           Node es -> enumerateEdge scs =<< lift es
+                          --  Mu m    -> TermFragmentUVar <$> addUVarValue (Just n) -- assign to the mu node a variable, and move on with life
+                           Mu _    -> do
+                            config <- ask
+                            if maxDepth config <= 0 then
+                              TermFragmentUVar <$> addUVarValue (Just n)
+                            else
+                              local (\x -> initEnumerationConfig (maxDepth x - 1)) (enumerateNode scs (unfoldOuterRec n))
+                           Node es -> enumerateEdge scs =<< lift (lift es) -- for each of its incoming edges, enumerate and assimilate for output (I guess this implicitly forces left to right DFS)
                            _       -> error $ "enumerateNode: unexpected node " <> show n
 
+       -- this case is identical between Mu and "Lambda" nodes
        (x :<| xs)     -> do reps <- mapM (getUVarRepresentative . scGetUVar) hereConstraints
-                            forM_ xs $ \sc -> uvarRepresentative %= UnionFind.union (scGetUVar x) (scGetUVar sc)
+                            forM_ xs $ \sc -> uvarRepresentative %= UnionFind.union (scGetUVar x) (scGetUVar sc) -- we know these are of the type \epsilon = v_i, so all v_i are now equal
                             uv <- getUVarRepresentative (scGetUVar x)
-                            mapM_ (assimilateUvarVal uv) reps
+                            mapM_ (assimilateUvarVal uv) reps -- actually intersect their p terms
 
-                            mergeNodeIntoUVarVal uv n descendantConstraints
-                            return $ TermFragmentUVar uv
+                            mergeNodeIntoUVarVal uv n descendantConstraints -- intersect this node with whatever remains of the other p terms
+                            return $ TermFragmentUVar uv -- mark this node as uv, and return the fragment of uv
 
 enumerateEdge :: Seq SuspendedConstraint -> Edge -> EnumerateM TermFragment
 enumerateEdge scs e = do
   let highestConstraintIndex = getMax $ foldMap (\sc -> Max $ fromMaybe (-1) $ getMaxNonemptyIndex $ scGetPathTrie sc) scs
-  guard $ highestConstraintIndex < length (edgeChildren e)
+  guard $ highestConstraintIndex < length (edgeChildren e) -- if this fails, the constraint is unsat on this edge
 
   newScs <- Sequence.fromList <$> mapM pecToSuspendedConstraint (unsafeGetEclasses $ edgeEcs e)
-  let scs' = scs <> newScs
+  let scs' = scs <> newScs -- append this edge's constraints onto the running list
   TermFragmentNode (edgeSymbol e) <$> imapM (\i n -> enumerateNode (descendScs i scs') n) (edgeChildren e)
 
+-- mu a. f(g(a), g(a))
+-- g(mu a. g(f(a), f(a)))
+
+-- f(mu a. g(f(a,a)) | z, mu a. g(f(a,a)) | z)
+
+m1 = Mu $ \r -> Node [mkEdge "f" [Node [Edge "g" [r], Edge "g" [r]]] (mkEqConstraints [[path [0, 0, 0], path [0, 0, 1]]]), Edge "f" [Node [Edge "z" [], Edge "z" []]]]
+m2 = Node [Edge "f" [Mu $ \r -> Node [mkEdge "g" [Node [Edge "f" [r, r]]] (mkEqConstraints [[path [0, 0], path [0, 1]]]), Edge "z" []], Mu $ \r -> Node [mkEdge "g" [Node [Edge "f" [r, r]]] (mkEqConstraints [[path [0, 0], path [0, 1]]]), Edge "z" []]]]
 
 ---------------------
 -------- Enumeration-loop control
@@ -304,9 +335,11 @@ firstExpandableUVar = do
     candidateMaps <- mapM (\i -> do rep <- getUVarRepresentative (intToUVar i)
                                     v <- getUVarValue rep
                                     case v of
-                                        (UVarUnenumerated (Just (Mu _)) Sequence.Empty) -> return IntMap.empty
-                                        (UVarUnenumerated (Just (Mu _)) _             ) -> return $ IntMap.singleton (uvarToInt rep) (Any False)
-                                        (UVarUnenumerated (Just _)      _)              -> return $ IntMap.singleton (uvarToInt rep) (Any False)
+                                        -- TODO: SANKALP: what does this mean for mu enumeration?
+                                        -- here for the core algorithm :
+                                        -- (UVarUnenumerated (Just (Mu _)) Sequence.Empty) -> return IntMap.empty                                    -- if there is a Mu node with no constraints, leave it be
+                                        (UVarUnenumerated (Just (Mu _)) _             ) -> return $ IntMap.singleton (uvarToInt rep) (Any False)  -- if there is a constrained Mu node, continue unfolding till you get lasso
+                                        (UVarUnenumerated (Just _)      _)              -> return $ IntMap.singleton (uvarToInt rep) (Any False)  -- if there is a normal node, keep unfolding it
                                         _                                               -> return IntMap.empty)
                               [0..(Sequence.length values - 1)]
     let candidates = IntMap.unions candidateMaps
@@ -323,18 +356,21 @@ firstExpandableUVar = do
                       values
 
       let unconstrainedCandidateMap = IntMap.filter (not . getAny) (ruledOut <> candidates)
-      case IntMap.lookupMin unconstrainedCandidateMap of
+      case IntMap.lookupMin unconstrainedCandidateMap of -- TODO: SANKALP: this causes enumeration of only one side
         Nothing     -> return ExpansionStuck
         Just (i, _) -> return $ ExpansionNext $ intToUVar i
-
-
 
 enumerateOutUVar :: UVar -> EnumerateM TermFragment
 enumerateOutUVar uv = do UVarUnenumerated (Just n) scs <- getUVarValue uv
                          uv' <- getUVarRepresentative uv
 
                          t <- case n of
-                                Mu _ -> enumerateNode scs (unfoldOuterRec n)
+                                Mu _ -> do
+                                        config <- ask
+                                        if maxDepth config <= 0 then
+                                          TermFragmentUVar <$> addUVarValue (Just n)
+                                        else
+                                          local (\x -> initEnumerationConfig (maxDepth x - 1)) (enumerateNode scs (unfoldOuterRec n))
                                 _    -> enumerateNode scs n
 
 
@@ -356,13 +392,12 @@ enumerateFully = do
   case muv of
     ExpansionStuck   -> mzero
     ExpansionDone    -> return ()
-    ExpansionNext uv -> do UVarUnenumerated (Just n) scs <- getUVarValue uv
-                           if scs == Sequence.Empty then
-                             case n of
-                               Mu _ -> return ()
-                               _    -> enumerateOutUVar uv >> enumerateFully
-                            else
-                             enumerateOutUVar uv >> enumerateFully
+    ExpansionNext uv -> enumerateOutUVar uv >> 
+                        -- problem: if a mu node produces a UVar, it cannot embed the information with it that its unrolling depth is to be reduced
+                        -- as such, currently the depth limits unfolding of all UVars :(
+                        do
+                        config <- ask
+                        unless (maxDepth config <= 0) $ local (\x -> initEnumerationConfig (maxDepth x - 1)) enumerateFully
 
 ---------------------
 -------- Expanding an enumerated term fragment into a term
@@ -385,14 +420,21 @@ expandUVar uv = do UVarEnumerated t <- getUVarValue uv
 -------- Full enumeration
 ---------------------
 
+-- rotate the arguments of a three argument function one step
+rotate3 :: (t1 -> t2 -> t3 -> t4) -> t2 -> t3 -> t1 -> t4
+rotate3 f x y z = f z x y
+
+defaultUnrollingDepth :: Int
+defaultUnrollingDepth = 5
+
 getAllTruncatedTerms :: Node -> [Term]
 getAllTruncatedTerms n = map (termFragToTruncatedTerm . fst) $
-                         flip runEnumerateM (initEnumerationState n) $ do
+                         rotate3 runEnumerateM (initEnumerationConfig defaultUnrollingDepth) (initEnumerationState n) $ do
                            enumerateFully
                            getTermFragForUVar (intToUVar 0)
 
 getAllTerms :: Node -> [Term]
-getAllTerms n = map fst $ flip runEnumerateM (initEnumerationState n) $ do
+getAllTerms n = map fst $ rotate3 runEnumerateM (initEnumerationConfig defaultUnrollingDepth) (initEnumerationState n) $ do
                   enumerateFully
                   expandUVar (intToUVar 0)
 

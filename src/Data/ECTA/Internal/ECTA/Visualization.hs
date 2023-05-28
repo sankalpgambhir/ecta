@@ -2,6 +2,7 @@
 
 module Data.ECTA.Internal.ECTA.Visualization (
     toDot
+    , prettyPrintDot
   ) where
 
 import qualified Data.Text as Text
@@ -17,6 +18,7 @@ import Data.ECTA.Internal.Paths ( EqConstraints )
 import Data.ECTA.Internal.Term
 import Data.Interned.Extended.HashTableBased ( Id )
 import Data.Text.Extended.Pretty
+import Language.Dot (prettyPrintDot)
 
 ---------------------------------------------------------------
 ----------------------- Visualization -------------------------

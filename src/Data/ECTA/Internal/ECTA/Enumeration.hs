@@ -69,6 +69,10 @@ import qualified Data.Persistent.UnionFind as UnionFind
 import Data.Text.Extended.Pretty
 import Control.Monad.Reader
 import Text.ParserCombinators.ReadPrec (reset)
+import Data.Map (Map, singleton, findWithDefault, insert)
+import qualified Control.Applicative as Map
+import qualified Control.Lens as Map
+import qualified Data.HashMap.Lazy as Map
 
 -------------------------------------------------------------------------------
 
@@ -140,17 +144,21 @@ data EnumerationState = EnumerationState {
     _uvarCounter        :: UVarGen
   , _uvarRepresentative :: UnionFind
   , _uvarValues         :: Seq UVarValue
+  , _uvarMaxDepth       :: Map UVar Int
   }
   deriving ( Eq, Ord, Show )
 
 makeLenses ''EnumerationState
 
+defaultUnrollingDepth :: Int
+defaultUnrollingDepth = 5
 
 initEnumerationState :: Node -> EnumerationState
 initEnumerationState n = let (uvg, uv) = UnionFind.nextUVar UnionFind.initUVarGen
                          in EnumerationState uvg
                                              (UnionFind.withInitialValues [uv])
                                              (Sequence.singleton (UVarUnenumerated (Just n) Sequence.Empty))
+                                             (singleton uv defaultUnrollingDepth)
 
 
 -----------------------
@@ -191,9 +199,11 @@ nextUVar = do c <- use uvarCounter
               uvarCounter .= c'
               return uv
 
-addUVarValue :: Maybe Node -> EnumerateM UVar
-addUVarValue x = do uv <- nextUVar
-                    uvarValues %= (:|> (UVarUnenumerated x Sequence.Empty))
+addUVarValue :: Maybe Node -> Int -> EnumerateM UVar
+addUVarValue x d = do
+                    uv <- nextUVar
+                    uvarValues %= (:|> UVarUnenumerated x Sequence.Empty)
+                    uvarMaxDepth %= insert uv d
                     return uv
 
 getUVarValue :: UVar -> EnumerateM UVarValue
@@ -216,7 +226,7 @@ getUVarRepresentative uv = do uf <- use uvarRepresentative
 ---------------------
 
 pecToSuspendedConstraint :: PathEClass -> EnumerateM SuspendedConstraint
-pecToSuspendedConstraint pec = do uv <- addUVarValue Nothing
+pecToSuspendedConstraint pec = do uv <- addUVarValue Nothing defaultUnrollingDepth
                                   return $ SuspendedConstraint (getPathTrie pec) uv
 
 
@@ -289,7 +299,7 @@ enumerateNode scs n         =
                            Mu _    -> do
                             config <- ask
                             if maxDepth config <= 0 then
-                              TermFragmentUVar <$> addUVarValue (Just n)
+                              TermFragmentUVar <$> addUVarValue (Just n) 0
                             else
                               local (\x -> initEnumerationConfig (maxDepth x - 1)) (enumerateNode scs (unfoldOuterRec n))
                            Node es -> enumerateEdge scs =<< lift (lift es) -- for each of its incoming edges, enumerate and assimilate for output (I guess this implicitly forces left to right DFS)
@@ -334,6 +344,8 @@ firstExpandableUVar = do
     -- check representative uvars because only representatives are updated
     candidateMaps <- mapM (\i -> do rep <- getUVarRepresentative (intToUVar i)
                                     v <- getUVarValue rep
+                                    varDepth <- use uvarMaxDepth
+                                    guard $ findWithDefault 0 rep varDepth > 0
                                     case v of
                                         -- TODO: SANKALP: what does this mean for mu enumeration?
                                         -- here for the core algorithm :
@@ -367,14 +379,16 @@ enumerateOutUVar uv = do UVarUnenumerated (Just n) scs <- getUVarValue uv
                          t <- case n of
                                 Mu _ -> do
                                         config <- ask
-                                        if maxDepth config <= 0 then
-                                          TermFragmentUVar <$> addUVarValue (Just n)
+                                        varDepth <- use uvarMaxDepth
+                                        let depth = max (maxDepth config) (findWithDefault 0 uv' varDepth)
+                                        if depth <= 0 then
+                                          TermFragmentUVar <$> addUVarValue (Just n) 0 -- a variable not to be unrolled more
                                         else
-                                          local (\x -> initEnumerationConfig (maxDepth x - 1)) (enumerateNode scs (unfoldOuterRec n))
+                                          local (const $ initEnumerationConfig (depth - 1)) (enumerateNode scs (unfoldOuterRec n))
                                 _    -> enumerateNode scs n
 
 
-                         uvarValues.(ix $ uvarToInt uv') .= UVarEnumerated t
+                         uvarValues.ix (uvarToInt uv') .= UVarEnumerated t
                          refreshReferencedUVars
                          return t
 
@@ -392,9 +406,8 @@ enumerateFully = do
   case muv of
     ExpansionStuck   -> mzero
     ExpansionDone    -> return ()
-    ExpansionNext uv -> enumerateOutUVar uv >> 
-                        -- problem: if a mu node produces a UVar, it cannot embed the information with it that its unrolling depth is to be reduced
-                        -- as such, currently the depth limits unfolding of all UVars :(
+    ExpansionNext uv -> enumerateOutUVar uv
+                        >>
                         do
                         config <- ask
                         unless (maxDepth config <= 0) $ local (\x -> initEnumerationConfig (maxDepth x - 1)) enumerateFully
@@ -423,9 +436,6 @@ expandUVar uv = do UVarEnumerated t <- getUVarValue uv
 -- rotate the arguments of a three argument function one step
 rotate3 :: (t1 -> t2 -> t3 -> t4) -> t2 -> t3 -> t1 -> t4
 rotate3 f x y z = f z x y
-
-defaultUnrollingDepth :: Int
-defaultUnrollingDepth = 5
 
 getAllTruncatedTerms :: Node -> [Term]
 getAllTruncatedTerms n = map (termFragToTruncatedTerm . fst) $

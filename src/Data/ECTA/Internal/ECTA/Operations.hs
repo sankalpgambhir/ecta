@@ -345,6 +345,10 @@ intersectOpen = memo (NameTag "intersectOpen") (\(dom, l, r) -> refold $ nodeDro
           (EmptyNode, _) -> EmptyNode
           (_, EmptyNode) -> EmptyNode
 
+          -- If one of them is a recursive intersection variable (see below), we have no information to intersect them, so treat them as being different
+          (Rec (RecIntersect _), _) -> EmptyNode
+          (_, Rec (RecIntersect _)) -> EmptyNode
+
           -- For closed terms, improve memoization performance by using the empty environment
           _ | Set.null (freeVars l), Set.null (freeVars r), not (Map.null (idFree dom)) -> intersect l r
 

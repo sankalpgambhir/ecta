@@ -345,7 +345,8 @@ intersectOpen = memo (NameTag "intersectOpen") (\(dom, l, r) -> refold $ nodeDro
           (EmptyNode, _) -> EmptyNode
           (_, EmptyNode) -> EmptyNode
 
-          -- If one of them is a recursive intersection variable (see below), we have no information to intersect them, so treat them as being different
+          -- If one of the inputs is a recursive intersection variable (see below), we have no information to intersect them, so treat them as being different
+          -- this only shows up during dropRedundantEdges, so it does not affect soundness
           (Rec (RecIntersect _), _) -> EmptyNode
           (_, Rec (RecIntersect _)) -> EmptyNode
 
